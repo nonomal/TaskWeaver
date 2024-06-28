@@ -110,7 +110,12 @@ class Planner(Role):
     def compose_sys_prompt(self):
         worker_description = ""
         for alias, role in self.workers.items():
-            worker_description += f"{alias}:\n{role.get_intro()}\n\n"
+            worker_description += (
+                f"###{alias}\n"
+                f"- The name of this Worker is `{alias}`\n"
+                f"{role.get_intro()}\n"
+                f'- The input of {alias} will be prefixed with "{alias}:" in the chat history.\n\n'
+            )
 
         instruction = self.instruction_template.format(
             planner_response_schema=self.response_schema,
@@ -275,6 +280,7 @@ class Planner(Role):
         llm_stream = self.llm_api.chat_completion_stream(
             chat_history,
             use_smoother=True,
+            llm_alias=self.config.llm_alias,
         )
 
         llm_output: List[str] = []

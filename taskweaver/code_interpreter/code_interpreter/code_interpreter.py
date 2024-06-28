@@ -1,5 +1,5 @@
 import os
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 from injector import inject
 
@@ -10,6 +10,7 @@ from taskweaver.code_interpreter.code_interpreter import (
     format_output_revision_message,
 )
 from taskweaver.code_interpreter.code_verification import code_snippet_verification, format_code_correction_message
+from taskweaver.code_interpreter.interpreter import Interpreter
 from taskweaver.logging import TelemetryLogger
 from taskweaver.memory import Memory, Post
 from taskweaver.memory.attachment import AttachmentType
@@ -60,6 +61,8 @@ class CodeInterpreterConfig(RoleConfig):
             ],
         )
 
+        self.code_prefix = self._get_str("code_prefix", "")
+
 
 def update_verification(
     response: PostEventProxy,
@@ -82,7 +85,7 @@ def update_execution(
     response.update_attachment(result, AttachmentType.execution_result)
 
 
-class CodeInterpreter(Role):
+class CodeInterpreter(Role, Interpreter):
     @inject
     def __init__(
         self,
@@ -118,6 +121,10 @@ class CodeInterpreter(Role):
 
     def get_intro(self) -> str:
         return self.intro.format(plugin_description=self.plugin_description)
+
+    def update_session_variables(self, session_variables: Dict[str, str]):
+        self.logger.info(f"Updating session variables: {session_variables}")
+        self.executor.update_session_var(session_variables)
 
     @tracing_decorator
     def reply(
@@ -228,18 +235,25 @@ class CodeInterpreter(Role):
         elif len(code_verify_errors) == 0:
             update_verification(post_proxy, "CORRECT", "No error is found.")
 
+        executable_code = f"{code.content}"
+        full_code_prefix = None
+        if self.config.code_prefix:
+            full_code_prefix = f"{self.config.code_prefix}\n" "## CODE START ##\n"
+            executable_code = f"{full_code_prefix}{executable_code}"
+
         post_proxy.update_status("executing code")
-        self.logger.info(f"Code to be executed: {code.content}")
+        self.logger.info(f"Code to be executed: {executable_code}")
 
         exec_result = self.executor.execute_code(
             exec_id=post_proxy.post.id,
-            code=code.content,
+            code=executable_code,
         )
 
         code_output = self.executor.format_code_output(
             exec_result,
             with_code=False,
             use_local_uri=self.config.use_local_uri,
+            code_mask=full_code_prefix,
         )
 
         update_execution(
@@ -266,6 +280,7 @@ class CodeInterpreter(Role):
                 exec_result,
                 with_code=True,  # the message to be sent to the user should contain the code
                 use_local_uri=self.config.use_local_uri,
+                code_mask=full_code_prefix,
             ),
             is_end=True,
         )
