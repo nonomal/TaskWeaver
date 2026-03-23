@@ -1,15 +1,12 @@
 import os
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 from injector import inject
 
 from taskweaver.code_interpreter.code_executor import CodeExecutor
-from taskweaver.code_interpreter.code_interpreter import (
-    CodeGenerator,
-    format_code_revision_message,
-    format_output_revision_message,
-)
+from taskweaver.code_interpreter.code_interpreter import CodeGenerator
 from taskweaver.code_interpreter.code_verification import code_snippet_verification, format_code_correction_message
+from taskweaver.code_interpreter.interpreter import Interpreter
 from taskweaver.logging import TelemetryLogger
 from taskweaver.memory import Memory, Post
 from taskweaver.memory.attachment import AttachmentType
@@ -57,8 +54,20 @@ class CodeInterpreterConfig(RoleConfig):
                 "raw_input",
                 "reload",
                 "__import__",
+                # Dynamic attribute access functions that can bypass security checks
+                "getattr",
+                "setattr",
+                "delattr",
+                "vars",
+                "globals",
+                "locals",
+                "__getattribute__",
+                "__setattr__",
+                "__delattr__",
             ],
         )
+
+        self.code_prefix = self._get_str("code_prefix", "")
 
 
 def update_verification(
@@ -82,7 +91,7 @@ def update_execution(
     response.update_attachment(result, AttachmentType.execution_result)
 
 
-class CodeInterpreter(Role):
+class CodeInterpreter(Role, Interpreter):
     @inject
     def __init__(
         self,
@@ -98,8 +107,22 @@ class CodeInterpreter(Role):
 
         self.generator = generator
         self.generator.set_alias(self.alias)
+
+        # Determine if code verification should be enabled
+        # Enable by default for local mode for security reasons
+        code_verification_on = self.config.code_verification_on
+        kernel_mode = executor.exec_mgr.get_kernel_mode()
+        if kernel_mode == "local" and not self.config.code_verification_on:
+            code_verification_on = True
+            logger.warning(
+                "Code verification is automatically enabled for local mode. "
+                "Running in local mode without code verification poses security risks. "
+                "To disable, explicitly set code_verification_on=False in config, but this is not recommended. "
+                "For better security, consider using container mode.",
+            )
+
         self.generator.configure_verification(
-            code_verification_on=self.config.code_verification_on,
+            code_verification_on=code_verification_on,
             allowed_modules=self.config.allowed_modules,
             blocked_functions=self.config.blocked_functions,
         )
@@ -119,14 +142,20 @@ class CodeInterpreter(Role):
     def get_intro(self) -> str:
         return self.intro.format(plugin_description=self.plugin_description)
 
+    def update_session_variables(self, session_variables: Dict[str, str]):
+        self.logger.info(f"Updating session variables: {session_variables}")
+        self.executor.update_session_var(session_variables)
+
     @tracing_decorator
     def reply(
         self,
         memory: Memory,
         prompt_log_path: Optional[str] = None,
+        **kwargs: ...,
     ) -> Post:
         post_proxy = self.event_emitter.create_post_proxy(self.alias)
         post_proxy.update_status("generating code")
+        self.executor.start()
         self.generator.reply(
             memory,
             post_proxy,
@@ -144,7 +173,7 @@ class CodeInterpreter(Role):
             return post_proxy.end()
 
         code = next(
-            (a for a in post_proxy.post.attachment_list if a.type == AttachmentType.python),
+            (a for a in post_proxy.post.attachment_list if a.type == AttachmentType.reply_content),
             None,
         )
 
@@ -164,7 +193,7 @@ class CodeInterpreter(Role):
             )
             post_proxy.update_message("Failed to generate code.")
             if self.retry_count < self.config.max_retry_count:
-                error_message = format_output_revision_message()
+                error_message = self.generator.format_output_revision_message()
                 post_proxy.update_attachment(
                     error_message,
                     AttachmentType.revise_message,
@@ -228,18 +257,25 @@ class CodeInterpreter(Role):
         elif len(code_verify_errors) == 0:
             update_verification(post_proxy, "CORRECT", "No error is found.")
 
+        executable_code = f"{code.content}"
+        full_code_prefix = None
+        if self.config.code_prefix:
+            full_code_prefix = f"{self.config.code_prefix}\n" "## CODE START ##\n"
+            executable_code = f"{full_code_prefix}{executable_code}"
+
         post_proxy.update_status("executing code")
-        self.logger.info(f"Code to be executed: {code.content}")
+        self.logger.info(f"Code to be executed: {executable_code}")
 
         exec_result = self.executor.execute_code(
             exec_id=post_proxy.post.id,
-            code=code.content,
+            code=executable_code,
         )
 
         code_output = self.executor.format_code_output(
             exec_result,
             with_code=False,
             use_local_uri=self.config.use_local_uri,
+            code_mask=full_code_prefix,
         )
 
         update_execution(
@@ -266,6 +302,7 @@ class CodeInterpreter(Role):
                 exec_result,
                 with_code=True,  # the message to be sent to the user should contain the code
                 use_local_uri=self.config.use_local_uri,
+                code_mask=full_code_prefix,
             ),
             is_end=True,
         )
@@ -275,7 +312,7 @@ class CodeInterpreter(Role):
         else:
             post_proxy.update_send_to("CodeInterpreter")
             post_proxy.update_attachment(
-                format_code_revision_message(),
+                self.generator.format_code_revision_message(),
                 AttachmentType.revise_message,
             )
             self.retry_count += 1
